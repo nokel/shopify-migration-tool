@@ -41,8 +41,8 @@ def main():
         
         # Summary
         logger.info("=== Connection Test Results ===")
-        logger.info(f"Shopify: {'✓ SUCCESS' if shopify_success else '✗ FAILED'}")
-        logger.info(f"WooCommerce: {'✓ SUCCESS' if woocommerce_success else '✗ FAILED'}")
+        logger.info(f"Shopify: {'SUCCESS' if shopify_success else 'FAILED'}")
+        logger.info(f"WooCommerce: {'SUCCESS' if woocommerce_success else 'FAILED'}")
         
         if shopify_success and woocommerce_success:
             logger.info("All connections successful! Ready to migrate.")

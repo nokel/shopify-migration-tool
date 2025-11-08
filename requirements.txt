@@ -8,3 +8,14 @@ colorama>=0.4.4
 python-dateutil>=2.8.2
 urllib3>=1.26.0
 certifi>=2022.0.0
+certifi
+colorama
+Pillow
+python-dateutil
+python-dotenv
+requests
+shopifyapi
+tqdm
+urllib3
+woocommerce
+beautifulsoup4>=4.12.0

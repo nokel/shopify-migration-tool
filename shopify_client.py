@@ -6,7 +6,7 @@ from logger import setup_logger
 logger = setup_logger(__name__)
 
 class ShopifyClient:
-    def __init__(self, store_url, access_token, max_retries=3, delay=1):
+    def __init__(self, store_url, access_token, max_retries=3, delay=1.0):
         self.store_url = store_url.rstrip('/')
         self.access_token = access_token
         self.max_retries = max_retries
@@ -130,9 +130,28 @@ class ShopifyClient:
         return custom_collections + smart_collections
     
     def get_discounts(self):
-        """Get all discount codes"""
+        """Get all discount codes - Note: This endpoint may not exist in all Shopify versions"""
         logger.info("Fetching discount codes from Shopify...")
-        return self.get_paginated_data('discount_codes.json')
+        try:
+            # Try to get price rules (modern discount system)
+            discounts = self.get_paginated_data('price_rules.json')
+            if discounts:
+                logger.info(f"Retrieved {len(discounts)} price rules")
+                return discounts
+        except Exception as e:
+            logger.warning(f"Price rules not available: {e}")
+        
+        try:
+            # Fallback to old discount codes endpoint
+            discounts = self.get_paginated_data('discount_codes.json')
+            if discounts:
+                logger.info(f"Retrieved {len(discounts)} discount codes")
+                return discounts
+        except Exception as e:
+            logger.warning(f"Discount codes not available: {e}")
+        
+        logger.info("No discount codes found or endpoint not available")
+        return []
         
     def test_connection(self):
         """Test the connection to Shopify"""
