@@ -14,6 +14,10 @@ class Config:
     WOOCOMMERCE_CONSUMER_KEY = os.getenv('WOOCOMMERCE_CONSUMER_KEY')
     WOOCOMMERCE_CONSUMER_SECRET = os.getenv('WOOCOMMERCE_CONSUMER_SECRET')
     
+    # WordPress Configuration (for Media API)
+    WORDPRESS_USERNAME = os.getenv('WORDPRESS_USERNAME')
+    WORDPRESS_APP_PASSWORD = os.getenv('WORDPRESS_APP_PASSWORD')
+    
     # Migration Settings
     BATCH_SIZE = int(os.getenv('BATCH_SIZE', 50))
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')

@@ -10,6 +10,7 @@ from shopify_client import ShopifyClient
 from woocommerce_client import WooCommerceClient
 from wordpress_client import WordPressClient
 from data_mapper import DataMapper
+from image_manager import ImageManager
 from logger import setup_logger
 
 class MigrationEngine:
@@ -20,6 +21,7 @@ class MigrationEngine:
         self.shopify = None
         self.woocommerce = None
         self.wordpress = None
+        self.image_manager = None
         self.migration_report = {
             'start_time': None,
             'end_time': None,
@@ -41,6 +43,8 @@ class MigrationEngine:
         self.existing_products = []
         self.existing_categories = []
         self.existing_pages = []
+        self.existing_orders = []
+        self.used_placeholder_emails = set()  # Track generated placeholder emails
         
     def log(self, message, level='INFO'):
         """Log message and send to callback if available"""
@@ -74,6 +78,13 @@ class MigrationEngine:
                 wc_url, wc_key, wc_secret,
                 max_retries=Config.MAX_RETRIES,
                 delay=Config.DELAY_BETWEEN_REQUESTS
+            )
+            
+            # Initialize image manager with WordPress credentials for Media API
+            self.image_manager = ImageManager(
+                wc_url, wc_key, wc_secret, 
+                wp_username=wp_username, 
+                wp_app_password=wp_password
             )
             
             if wp_username and wp_password:
@@ -119,10 +130,11 @@ class MigrationEngine:
             self.existing_customers = self.woocommerce.get_existing_customers()
             self.existing_products = self.woocommerce.get_existing_products()
             self.existing_categories = self.woocommerce.get_existing_categories()
+            self.existing_orders = self.woocommerce.get_existing_orders()
             if self.wordpress:
                 self.existing_pages = self.wordpress.get_existing_pages()
             
-            self.log(f"[{mode_text}] Found {len(self.existing_customers)} existing customers, {len(self.existing_products)} existing products, {len(self.existing_categories)} existing categories, {len(self.existing_pages)} existing pages")
+            self.log(f"[{mode_text}] Found {len(self.existing_customers)} existing customers, {len(self.existing_products)} existing products, {len(self.existing_categories)} existing categories, {len(self.existing_orders)} existing orders, {len(self.existing_pages)} existing pages")
             
             # Run migration phases with clean counting
             self.update_progress(5, "Migrating categories...")
@@ -144,15 +156,40 @@ class MigrationEngine:
             self._migrate_pages_clean(dry_run)
             
             self.migration_report['end_time'] = datetime.now()
-            self.update_progress(100, "Migration completed!")
+            
+            # Determine completion status based on errors and failures
+            has_errors = len(self.migration_report['errors']) > 0
+            has_failures = any(
+                stats.get('failed', 0) > 0 
+                for stats in self.migration_report.values() 
+                if isinstance(stats, dict) and 'failed' in stats
+            )
+            
+            if has_errors or has_failures:
+                self.update_progress(100, "Migration completed with errors!")
+            else:
+                self.update_progress(100, "Migration completed successfully!")
             
             self._generate_migration_report(dry_run)
-            return True
+            
+            # Return dictionary with status information
+            return {
+                'success': True,  # Migration didn't crash
+                'has_errors': has_errors,
+                'has_failures': has_failures,
+                'report': self.migration_report
+            }
             
         except Exception as e:
             self.log(f"Migration failed: {e}", 'ERROR')
             self.migration_report['errors'].append(str(e))
-            return False
+            return {
+                'success': False,
+                'has_errors': True,
+                'has_failures': True,
+                'error': str(e),
+                'report': self.migration_report
+            }
 
     def _migrate_categories_clean(self, dry_run=False):
         """Clean category migration with single counting point"""
@@ -230,6 +267,27 @@ class MigrationEngine:
                 return existing
                 
         return None
+    
+    def _find_existing_product(self, product):
+        """Find existing WooCommerce product by SKU or name"""
+        # Try to find by SKU first (most reliable)
+        variants = product.get('variants', [])
+        if variants:
+            sku = variants[0].get('sku') or ''
+            sku = sku.strip() if sku else ''
+            if sku:
+                existing = next((p for p in self.existing_products if (p.get('sku') or '').strip() == sku), None)
+                if existing:
+                    return existing
+        
+        # Try to find by product name
+        product_name = product.get('title', '')
+        if product_name:
+            existing = next((p for p in self.existing_products if p.get('name') == product_name), None)
+            if existing:
+                return existing
+        
+        return None
 
     def _create_wc_category(self, collection):
         """Create WooCommerce category"""
@@ -256,31 +314,28 @@ class MigrationEngine:
                 error_msg = None
                 
                 try:
-                    email = customer.get('email')
+                    # Map customer (generates placeholder email if needed)
+                    wc_customer = DataMapper.map_customer(customer, self.used_placeholder_emails)
                     
-                    # Skip customers without email
-                    if not email:
-                        error_msg = f"Customer {customer.get('id')} has no email - skipping"
+                    if not wc_customer:
+                        error_msg = f"Customer {customer.get('id')} mapping failed"
                         
-                    # Check if already exists
-                    elif self._find_existing_customer(email):
-                        existing = self._find_existing_customer(email)
-                        self.id_mappings['customers'][str(customer.get('id'))] = existing.get('id')
-                        mode_text = "DRY RUN" if dry_run else "LIVE"
-                        self.log(f"[{mode_text}] Skipped existing customer: {email}")
-                        success = True
-                    elif dry_run:
-                        # Validate mapping in dry run
-                        wc_customer = DataMapper.map_customer(customer)
-                        if wc_customer:
+                    else:
+                        email = wc_customer.get('email')
+                        
+                        # Check if already exists
+                        if self._find_existing_customer(email):
+                            existing = self._find_existing_customer(email)
+                            self.id_mappings['customers'][str(customer.get('id'))] = existing.get('id')
+                            mode_text = "DRY RUN" if dry_run else "LIVE"
+                            self.log(f"[{mode_text}] Skipped existing customer: {email}")
+                            success = True
+                        elif dry_run:
+                            # Validate mapping in dry run
                             self.log(f"[DRY RUN] Would create customer: {email}")
                             success = True
                         else:
-                            error_msg = f"Customer mapping failed: {email}"
-                    else:
-                        # Create new customer
-                        wc_customer = DataMapper.map_customer(customer)
-                        if wc_customer:
+                            # Create new customer
                             result = self.woocommerce.create_customer(wc_customer)
                             if result:
                                 self.id_mappings['customers'][str(customer.get('id'))] = result.get('id')
@@ -288,8 +343,6 @@ class MigrationEngine:
                                 success = True
                             else:
                                 error_msg = f"Failed to create customer: {email}"
-                        else:
-                            error_msg = f"Customer mapping failed: {email}"
                             
                 except Exception as e:
                     error_msg = f"Error processing customer {customer.get('email', 'unknown')}: {e}"
@@ -318,57 +371,337 @@ class MigrationEngine:
         return next((c for c in self.existing_customers if c.get('email') == email), None)
 
     def _migrate_products_clean(self, dry_run=False):
-        """Clean product migration - simplified for now"""
-        # For now, just set basic counts to test the concept
-        products = self.shopify.get_products()
+        """Clean product migration with two-phase approach (products first, then images)"""
+        try:
+            products = self.shopify.get_products()
+            attempted = len(products)
+            successful = 0
+            failed = 0
+            products_with_images = []  # Track products that need images added
+            
+            self.log(f"Found {attempted} products to migrate")
+            
+            # Phase 1: Create products WITHOUT images to avoid timeout
+            for product in products:
+                success = False
+                error_msg = None
+                
+                try:
+                    product_name = product.get('title', 'Unknown')
+                    shopify_id = str(product.get('id'))
+                    
+                    # Check if already exists
+                    try:
+                        existing = self._find_existing_product(product)
+                    except Exception as find_error:
+                        self.log(f"Error checking if product exists: {find_error}", 'WARNING')
+                        existing = None
+                    
+                    if existing:
+                        self.id_mappings['products'][shopify_id] = existing.get('id')
+                        mode_text = "DRY RUN" if dry_run else "LIVE"
+                        self.log(f"[{mode_text}] Skipped existing product: {product_name}")
+                        success = True
+                        
+                        # Check if existing product needs images updated
+                        if not dry_run:
+                            images = product.get('images', [])
+                            if images:
+                                # Check if existing product has images
+                                existing_images = existing.get('images', [])
+                                if len(existing_images) == 0:
+                                    # Product exists but has no images - add to image processing queue
+                                    mapped_product = DataMapper.map_product(product)
+                                    if mapped_product:
+                                        product_images = mapped_product.get('images', [])
+                                        if product_images:
+                                            products_with_images.append({
+                                                'wc_id': existing.get('id'),
+                                                'name': product_name,
+                                                'images': product_images
+                                            })
+                                            self.log(f"Existing product '{product_name}' has no images - will add them")
+                    else:
+                        # Map product data
+                        mapped_product = DataMapper.map_product(product)
+                        
+                        if not mapped_product:
+                            error_msg = "Product mapping failed"
+                        elif dry_run:
+                            self.log(f"[DRY RUN] Would create product: {product_name}")
+                            success = True
+                        else:
+                            # Extract images before creating product
+                            images = mapped_product.get('images', [])
+                            
+                            # Create product WITHOUT images to avoid timeout
+                            result = self.woocommerce.create_product(mapped_product, include_images=False)
+                            
+                            if result:
+                                wc_product_id = result.get('id')
+                                self.id_mappings['products'][shopify_id] = wc_product_id
+                                self.log(f"Created product: {product_name} (ID: {wc_product_id})")
+                                success = True
+                                
+                                # Track for phase 2 if it has images
+                                if images:
+                                    products_with_images.append({
+                                        'wc_id': wc_product_id,
+                                        'name': product_name,
+                                        'images': images
+                                    })
+                            else:
+                                error_msg = "WooCommerce API returned None"
+                
+                except Exception as e:
+                    error_msg = str(e)
+                
+                # SINGLE counting point
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+                    if error_msg:
+                        self.log(f"Failed to create product {product.get('title', 'Unknown')}: {error_msg}", 'ERROR')
+                        self.migration_report['errors'].append(f"Product: {error_msg}")
+            
+            # Set final counts
+            self.migration_report['products']['attempted'] = attempted
+            self.migration_report['products']['successful'] = successful
+            self.migration_report['products']['failed'] = failed
+            self.migration_report['products']['variants'] = sum(len(p.get('variants', [])) for p in products)
+            
+            self.log(f"Products: {successful}/{attempted} successful, {failed} failed")
+            
+            # Phase 2: Download and upload images locally (if live migration and we have products with images)
+            if not dry_run and products_with_images:
+                self.log(f"Phase 2: Processing images for {len(products_with_images)} products...")
+                self.log("Downloading images from Shopify and uploading to WordPress Media Library...")
+                images_successful = 0
+                images_failed = 0
+                
+                for item in products_with_images:
+                    try:
+                        product_name = item['name']
+                        shopify_images = item['images']
+                        
+                        # Download images from Shopify and upload to WordPress Media Library
+                        wordpress_images = self.image_manager.process_product_images(
+                            product_name, 
+                            shopify_images
+                        )
+                        
+                        if wordpress_images:
+                            # Update product with WordPress Media Library image IDs
+                            result = self.woocommerce.update_product_images(item['wc_id'], wordpress_images)
+                            if result:
+                                images_successful += 1
+                                self.log(f"Added {len(wordpress_images)} images to product: {product_name}")
+                            else:
+                                images_failed += 1
+                                self.log(f"Failed to update product with images: {product_name}", 'ERROR')
+                        else:
+                            images_failed += 1
+                            self.log(f"Failed to process images for: {product_name}", 'ERROR')
+                            
+                    except Exception as e:
+                        images_failed += 1
+                        self.log(f"Error processing images for {item['name']}: {e}", 'ERROR')
+                
+                self.log(f"Images: {images_successful}/{len(products_with_images)} products updated successfully")
+                
+                # Clean up old downloaded images
+                try:
+                    self.image_manager.cleanup_old_images(days=7)
+                except Exception as e:
+                    self.log(f"Warning: Could not cleanup old images: {e}", 'ERROR')
         
-        self.migration_report['products']['attempted'] = len(products)
-        self.migration_report['products']['successful'] = len(products) if dry_run else 0
-        self.migration_report['products']['failed'] = 0 if dry_run else len(products)
-        self.migration_report['products']['variants'] = sum(len(p.get('variants', [])) for p in products)
+        except Exception as e:
+            self.log(f"Error in product migration: {e}", 'ERROR')
+            self.migration_report['errors'].append(f"Product migration: {str(e)}")
+
+    def _find_existing_order(self, shopify_order_id, shopify_order_number):
+        """Find existing WooCommerce order by Shopify order ID or number
         
-        self.log(f"Products: {len(products)} found (simplified migration for testing)")
+        Args:
+            shopify_order_id: Shopify order ID
+            shopify_order_number: Shopify order number
+            
+        Returns:
+            WooCommerce order object if found, None otherwise
+        """
+        for wc_order in self.existing_orders:
+            # Check meta_data for shopify_order_id or shopify_order_number
+            meta_data = wc_order.get('meta_data', [])
+            for meta in meta_data:
+                if meta.get('key') == 'shopify_order_id' and str(meta.get('value')) == str(shopify_order_id):
+                    return wc_order
+                if meta.get('key') == 'shopify_order_number' and str(meta.get('value')) == str(shopify_order_number):
+                    return wc_order
+        return None
+    
+    def _order_needs_update(self, existing_order, new_order_data):
+        """Check if an order has meaningful differences that require an update
+        
+        Args:
+            existing_order: Current WooCommerce order
+            new_order_data: New order data from Shopify mapping
+            
+        Returns:
+            Boolean indicating if update is needed
+        """
+        # Compare key fields that might change
+        fields_to_compare = [
+            'status',
+            'total',
+            'subtotal', 
+            'total_tax',
+            'shipping_total',
+            'discount_total'
+        ]
+        
+        for field in fields_to_compare:
+            existing_val = str(existing_order.get(field, ''))
+            new_val = str(new_order_data.get(field, ''))
+            if existing_val != new_val:
+                self.log(f"Order field '{field}' changed: '{existing_val}' → '{new_val}'", 'DEBUG')
+                return True
+        
+        # Compare line items count
+        existing_items = len(existing_order.get('line_items', []))
+        new_items = len(new_order_data.get('line_items', []))
+        if existing_items != new_items:
+            self.log(f"Line items count changed: {existing_items} → {new_items}", 'DEBUG')
+            return True
+        
+        # Compare line item quantities and totals
+        for i, (existing_item, new_item) in enumerate(zip(
+            existing_order.get('line_items', []),
+            new_order_data.get('line_items', [])
+        )):
+            if str(existing_item.get('quantity')) != str(new_item.get('quantity')):
+                return True
+            if str(existing_item.get('total')) != str(new_item.get('total')):
+                return True
+        
+        # No meaningful differences found
+        return False
 
     def _migrate_orders_clean(self, dry_run=False):
-        """Clean order migration with single counting point"""
+        """Clean order migration with single counting point and duplicate detection"""
         try:
             orders = self.shopify.get_orders()
             attempted = len(orders)
             successful = 0
             failed = 0
+            skipped = 0
+            updated = 0
             
             self.log(f"Found {attempted} orders to migrate")
             
             for order in orders:
                 success = False
                 error_msg = None
+                is_update = False
                 
                 try:
                     order_number = order.get('order_number', 'Unknown')
+                    shopify_order_id = order.get('id')
+                    
+                    # Check if order already exists in WooCommerce
+                    existing_order = self._find_existing_order(shopify_order_id, order_number)
                     
                     if dry_run:
-                        # Validate mapping in dry run
-                        wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
-                        if wc_order:
-                            self.log(f"[DRY RUN] Would create order: {order_number}")
-                            success = True
-                        else:
-                            error_msg = f"Order mapping failed: {order_number}"
-                    else:
-                        # Create new order
-                        wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
-                        if wc_order:
-                            # Map line items to WooCommerce products
-                            self._map_order_line_items(wc_order, order)
-                            
-                            result = self.woocommerce.create_order(wc_order)
-                            if result:
-                                self.log(f"Created order: {order_number}")
+                        if existing_order:
+                            # Map the order data to check if update needed
+                            wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
+                            if wc_order:
+                                self._map_order_line_items(wc_order, order)
+                                if self._order_needs_update(existing_order, wc_order):
+                                    self.log(f"[DRY RUN] Order {order_number} already exists (WC ID: {existing_order.get('id')}), would update (changes detected)")
+                                else:
+                                    self.log(f"[DRY RUN] Order {order_number} already exists (WC ID: {existing_order.get('id')}), no changes needed")
                                 success = True
                             else:
-                                error_msg = f"Failed to create order: {order_number}"
+                                error_msg = f"Order mapping failed: {order_number}"
                         else:
-                            error_msg = f"Order mapping failed: {order_number}"
+                            # Validate mapping in dry run
+                            wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
+                            if wc_order:
+                                self.log(f"[DRY RUN] Would create order: {order_number}")
+                                success = True
+                            else:
+                                error_msg = f"Order mapping failed: {order_number}"
+                    else:
+                        if existing_order:
+                            # Order exists - check if update needed
+                            wc_order_id = existing_order.get('id')
+                            
+                            # Map the order data
+                            wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
+                            if wc_order:
+                                # Map line items to WooCommerce products
+                                self._map_order_line_items(wc_order, order)
+                                
+                                # Check if update is actually needed
+                                if self._order_needs_update(existing_order, wc_order):
+                                    self.log(f"Order {order_number} has changes, updating... (WC ID: {wc_order_id})")
+                                    
+                                    # IMPORTANT: Remove line_items and shipping_lines from update to prevent duplication
+                                    # WooCommerce API appends these on update instead of replacing
+                                    # Only update order-level fields, not line items or shipping
+                                    update_data = wc_order.copy()
+                                    update_data.pop('line_items', None)
+                                    update_data.pop('shipping_lines', None)
+                                    
+                                    # Update the order
+                                    result = self.woocommerce.update_order(wc_order_id, update_data)
+                                    if result:
+                                        self.log(f"Updated order: {order_number} (WC ID: {wc_order_id})")
+                                        
+                                        # Update notes if needed
+                                        self._migrate_order_notes(wc_order_id, order, wc_order)
+                                        
+                                        success = True
+                                        is_update = True
+                                        updated += 1
+                                    else:
+                                        error_msg = f"Failed to update order: {order_number}"
+                                else:
+                                    # Order exists but no changes needed
+                                    self.log(f"Order {order_number} unchanged, skipping (WC ID: {wc_order_id})")
+                                    success = True
+                                    skipped += 1
+                            else:
+                                error_msg = f"Order mapping failed: {order_number}"
+                        else:
+                            # Order doesn't exist - create new order
+                            wc_order = DataMapper.map_order(order, self.id_mappings['customers'])
+                            if wc_order:
+                                # Map line items to WooCommerce products
+                                self._map_order_line_items(wc_order, order)
+                                
+                                result = self.woocommerce.create_order(wc_order)
+                                if result:
+                                    wc_order_id = result.get('id')
+                                    self.log(f"Created order: {order_number} (WC ID: {wc_order_id})")
+                                    
+                                    # Add Shopify order ID as private note
+                                    if shopify_order_id:
+                                        self.woocommerce.add_order_note(
+                                            wc_order_id,
+                                            f"Original Shopify order ID: {shopify_order_id}",
+                                            customer_note=False
+                                        )
+                                    
+                                    # Migrate Shopify notes as private WooCommerce notes (including job notes from $0 line items)
+                                    self._migrate_order_notes(wc_order_id, order, wc_order)
+                                    
+                                    success = True
+                                else:
+                                    error_msg = f"Failed to create order: {order_number}"
+                            else:
+                                error_msg = f"Order mapping failed: {order_number}"
                             
                 except Exception as e:
                     error_msg = f"Error processing order {order.get('order_number', 'unknown')}: {e}"
@@ -376,6 +709,9 @@ class MigrationEngine:
                 # SINGLE counting point
                 if success:
                     successful += 1
+                    if not is_update:
+                        # Only count as skipped if it already existed
+                        pass
                 else:
                     failed += 1
                     if error_msg:
@@ -387,16 +723,120 @@ class MigrationEngine:
             self.migration_report['orders']['successful'] = successful
             self.migration_report['orders']['failed'] = failed
             
-            self.log(f"Orders: {successful}/{attempted} successful, {failed} failed")
+            # Calculate created count (successful minus updated minus skipped)
+            created = successful - updated - skipped
+            
+            if updated > 0 or skipped > 0:
+                self.log(f"Orders: {successful}/{attempted} successful ({created} created, {updated} updated, {skipped} unchanged), {failed} failed")
+            else:
+                self.log(f"Orders: {successful}/{attempted} successful, {failed} failed")
             
         except Exception as e:
             self.log(f"Error in order migration: {e}", 'ERROR')
 
+    def _migrate_order_notes(self, wc_order_id, shopify_order, wc_order=None):
+        """Migrate Shopify order notes to WooCommerce as private notes
+        
+        Handles both:
+        1. Standard Shopify order notes (from 'note' field)
+        2. Job notes stored as $0 line items (extracted during mapping)
+        
+        Detects embedded images in notes and adds a placeholder note instead.
+        
+        Args:
+            wc_order_id: WooCommerce order ID
+            shopify_order: Shopify order data (original)
+            wc_order: Mapped WooCommerce order (may contain _job_notes)
+        """
+        try:
+            import re
+            notes_added = 0
+            
+            # First, handle job notes from $0 line items (if any)
+            if wc_order and '_job_notes' in wc_order:
+                job_notes = wc_order.get('_job_notes', [])
+                for job_note in job_notes:
+                    if job_note and job_note.strip():
+                        note_text = f"Job Notes (from Shopify line item):\n{job_note}"
+                        
+                        result = self.woocommerce.add_order_note(
+                            wc_order_id,
+                            note_text,
+                            customer_note=False
+                        )
+                        
+                        if result:
+                            notes_added += 1
+                            self.log(f"Added job note to WC order {wc_order_id}")
+                        else:
+                            self.log(f"Failed to add job note to WC order {wc_order_id}", 'ERROR')
+            
+            # Then, handle standard Shopify order note
+            shopify_note = shopify_order.get('note')
+            
+            if shopify_note and shopify_note.strip():
+                # Check for embedded images
+                has_img_tag = '<img' in shopify_note.lower()
+                has_cdn = 'cdn.shopify' in shopify_note.lower()
+                has_image_url = re.search(r'\.(jpg|jpeg|png|gif|webp)', shopify_note.lower())
+                
+                if has_img_tag or has_cdn or has_image_url:
+                    # Note contains images - strip them and add placeholder
+                    # Remove HTML img tags
+                    clean_note = re.sub(r'<img[^>]*>', '', shopify_note, flags=re.IGNORECASE)
+                    # Remove standalone image URLs
+                    clean_note = re.sub(r'https?://[^\s]*\.(jpg|jpeg|png|gif|webp)', '[image removed]', clean_note, flags=re.IGNORECASE)
+                    
+                    # Add note about images being removed
+                    note_text = "Shopify Order Note:\n"
+                    note_text += "[NOTE: Pictures were attached in the original Shopify order notes]\n\n"
+                    if clean_note.strip():
+                        note_text += clean_note.strip()
+                    else:
+                        note_text += "(Note contained only images)"
+                    
+                    self.log(f"Order note contains images - they will be stripped", 'WARNING')
+                else:
+                    # Normal note without images
+                    note_text = f"Shopify Order Note:\n{shopify_note}"
+                
+                # Add as private note (not visible to customer)
+                result = self.woocommerce.add_order_note(
+                    wc_order_id,
+                    note_text,
+                    customer_note=False
+                )
+                
+                if result:
+                    notes_added += 1
+                    self.log(f"Added order note to WC order {wc_order_id}")
+                else:
+                    self.log(f"Failed to add note to WC order {wc_order_id}", 'ERROR')
+            
+            if notes_added > 0:
+                self.log(f"Added {notes_added} note(s) to order {wc_order_id}")
+        
+        except Exception as e:
+            self.log(f"Error migrating notes for order {wc_order_id}: {e}", 'ERROR')
+    
     def _map_order_line_items(self, wc_order, shopify_order):
-        """Map Shopify line items to WooCommerce products"""
-        for item in wc_order.get('line_items', []):
+        """Map Shopify line items to WooCommerce products
+        
+        WooCommerce allows creating orders with unmapped items as custom/unlisted products.
+        Items without a product match will use product_id=0 and be treated as custom items.
+        """
+        shopify_line_items = shopify_order.get('line_items', [])
+        
+        for i, item in enumerate(wc_order.get('line_items', [])):
             shopify_variant_id = None
             shopify_product_id = None
+            sku = item.get('sku')  # Get SKU from mapped item (may be None or '')
+            
+            # WooCommerce API requires SKU to be a string, not None
+            # Convert None to empty string
+            if sku is None:
+                sku = ''
+                item['sku'] = ''
             
             # Extract Shopify IDs from meta_data
             for meta in item.get('meta_data', []):
@@ -405,11 +845,28 @@ class MigrationEngine:
                 elif meta.get('key') == 'shopify_product_id':
                     shopify_product_id = meta.get('value')
             
-            # Map to WooCommerce product/variation ID
+            # Try to map to WooCommerce product/variation ID
+            mapped = False
+            
             if shopify_variant_id and shopify_variant_id in self.id_mappings['variants']:
                 item['variation_id'] = self.id_mappings['variants'][shopify_variant_id]
+                mapped = True
             elif shopify_product_id and shopify_product_id in self.id_mappings['products']:
                 item['product_id'] = self.id_mappings['products'][shopify_product_id]
+                mapped = True
+            
+            # If we couldn't map by ID, try to use SKU
+            if not mapped and sku:
+                # Find product in existing products by SKU
+                wc_product = next((p for p in self.existing_products if p.get('sku') == sku), None)
+                if wc_product:
+                    item['product_id'] = wc_product.get('id')
+                    mapped = True
+            
+            # If still not mapped, leave product_id=0 and WooCommerce will treat as custom/unlisted item
+            # This allows orders with custom items (labour, custom parts, etc.) to be created
+            if not mapped:
+                self.log(f"Line item '{item.get('name')}' will be added as custom/unlisted item (no matching product)", 'INFO')
 
     def _migrate_coupons_clean(self, dry_run=False):
         """Clean coupon migration - simplified for now"""

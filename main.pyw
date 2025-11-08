@@ -290,43 +290,13 @@ class MigrationGUI:
                 return
             
             # Run migration
-            result = self.migration_engine.run_migration(dry_run)
+            success = self.migration_engine.run_migration(dry_run)
             
-            # Handle both old boolean and new dict return formats
-            if isinstance(result, dict):
-                success = result.get('success', False)
-                has_errors = result.get('has_errors', False)
-                has_failures = result.get('has_failures', False)
-                report = result.get('report', {})
-            else:
-                # Backwards compatibility with boolean return
-                success = result
-                has_errors = False
-                has_failures = False
-                report = {}
-            
-            mode = "dry run" if dry_run else "migration"
-            
-            if not success:
-                # Complete failure - migration crashed
-                self.add_log_message(f"{mode.title()} failed. Check the logs for details.")
-            elif has_errors or has_failures:
-                # Completed but with errors/failures
-                error_count = len(report.get('errors', []))
-                total_failures = sum(
-                    stats.get('failed', 0) 
-                    for stats in report.values() 
-                    if isinstance(stats, dict) and 'failed' in stats
-                )
-                self.add_log_message(f"{mode.title()} completed with errors!")
-                if error_count > 0:
-                    self.add_log_message(f"  - {error_count} error(s) logged")
-                if total_failures > 0:
-                    self.add_log_message(f"  - {total_failures} item(s) failed to migrate")
-                self.add_log_message("  Check the output above for details.")
-            else:
-                # Complete success
+            if success:
+                mode = "dry run" if dry_run else "migration"
                 self.add_log_message(f"{mode.title()} completed successfully!")
+            else:
+                self.add_log_message("Migration failed. Check the logs for details.")
                 
         except Exception as e:
             self.add_log_message(f"Error during migration: {str(e)}")
