@@ -26,11 +26,11 @@ curl https://yourdomain.com/wp-json/wc/v3/products \
 ### 2. Shopify API Credentials
 You need to create a private app in Shopify:
 
-1. From your Shopify admin, go to **Apps**
-2. Click **Develop apps for your store**
-3. Click **Create an app**
-4. Name it "WooCommerce Migration"
-5. Click **Configure Admin API scopes**
+1. From your Shopify admin, go to **Settings**
+2. Click **Apps and sales channels**
+3. Click **Develop apps**
+4. Name it "migrate"
+5. Click on **Admin API scopes** under Configuration
 6. Enable these scopes:
    - `read_products` - Products and collections
    - `read_customers` - Customer data
@@ -39,9 +39,10 @@ You need to create a private app in Shopify:
    - `read_discounts` - Discount codes
    - `read_shipping` - Shipping settings
    - `read_inventory` - Inventory levels
+   (To be safe enable all of the "read" access scopes)
 7. Click **Save**
 8. Click **Install app**
-9. Copy the Admin API access token
+9. Copy the Admin API access token into the .env file. (You'll only be shown it once, so if you forget it or save it somewhere you shouldn't and forget it, make sure you delete the "app" and then make another one and save it in so you don't accidentally leak sensitive information.
 
 ## Installation Steps
 
@@ -63,6 +64,7 @@ source venv/bin/activate
 # Install required packages
 pip install -r requirements.txt
 ```
+NOTE: If you don't want to use a virtual environment, that's fine, I didn't use one, it should still work as expected as long as everything is installed correctly from the requirements.txt. But instead of running the .bat or .sh files, just run "python main.py" or double click on the main.py/main.pyw file. Both should work the same way.
 
 ### 2. Configure API Credentials
 
@@ -84,10 +86,8 @@ LOG_LEVEL=INFO
 DRY_RUN=false
 ```
 
-### 3. Bluehost Specific Considerations
-
 #### File Permissions
-Ensure proper file permissions on your Bluehost server:
+Ensure proper file permissions on your server:
 ```bash
 # Set proper permissions for WordPress files
 find /path/to/wordpress/ -type d -exec chmod 755 {} \;
@@ -142,8 +142,6 @@ python migrate.py
 6. **Shipping Setup**: Verify shipping zones and methods
 7. **Tax Configuration**: Set up tax rules in WooCommerce
 
-## Troubleshooting
-
 ### Common Issues
 
 **API Connection Errors**
@@ -160,11 +158,6 @@ python migrate.py
 - Check migration logs for errors
 - Some data may need manual review
 - Custom fields may require additional mapping
-
-**Bluehost Specific**
-- Check cPanel error logs
-- Verify file permissions
-- Monitor resource usage
 
 ### Getting Help
 - Check migration logs in `logs/` directory
