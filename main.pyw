@@ -123,9 +123,18 @@ class MigrationGUI:
         self.dry_run_btn.grid(row=current_row, column=0, columnspan=3, sticky=(tk.W, tk.E), 
                               pady=(40, 10), padx=40, ipady=15)
         
-        self.migrate_btn = ttk.Button(parent, text="Migrate", command=self.run_migration)
-        self.migrate_btn.grid(row=current_row+1, column=0, columnspan=3, sticky=(tk.W, tk.E), 
-                              pady=10, padx=40, ipady=15)
+        # Frame for migrate and stop buttons side by side
+        migrate_frame = ttk.Frame(parent)
+        migrate_frame.grid(row=current_row+1, column=0, columnspan=3, sticky=(tk.W, tk.E), 
+                          pady=10, padx=40)
+        migrate_frame.columnconfigure(0, weight=1)
+        migrate_frame.columnconfigure(1, weight=0)
+        
+        self.migrate_btn = ttk.Button(migrate_frame, text="Migrate", command=self.run_migration)
+        self.migrate_btn.grid(row=0, column=0, sticky=(tk.W, tk.E), ipady=15)
+        
+        self.stop_btn = ttk.Button(migrate_frame, text="Stop", command=self.stop_migration, state='disabled')
+        self.stop_btn.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 0), ipady=15)
         
         # Configure column weights
         parent.columnconfigure(0, weight=0, minsize=230)  # Label column
@@ -221,11 +230,20 @@ class MigrationGUI:
         """Disable action buttons during migration"""
         self.dry_run_btn.config(state='disabled')
         self.migrate_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')  # Enable stop button
     
     def enable_buttons(self):
         """Enable action buttons after migration"""
         self.dry_run_btn.config(state='normal')
         self.migrate_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')  # Disable stop button
+    
+    def stop_migration(self):
+        """Request migration to stop gracefully"""
+        if self.migration_in_progress:
+            self.migration_engine.stop_migration()
+            self.add_log_message("STOP requested - migration will halt after current item...")
+            self.stop_btn.config(state='disabled')  # Disable to prevent multiple clicks
     
     def run_dry_run(self):
         """Run migration in dry run mode"""
@@ -290,13 +308,43 @@ class MigrationGUI:
                 return
             
             # Run migration
-            success = self.migration_engine.run_migration(dry_run)
+            result = self.migration_engine.run_migration(dry_run)
             
-            if success:
-                mode = "dry run" if dry_run else "migration"
-                self.add_log_message(f"{mode.title()} completed successfully!")
+            # Handle both old boolean and new dict return formats
+            if isinstance(result, dict):
+                success = result.get('success', False)
+                has_errors = result.get('has_errors', False)
+                has_failures = result.get('has_failures', False)
+                report = result.get('report', {})
             else:
-                self.add_log_message("Migration failed. Check the logs for details.")
+                # Backwards compatibility with boolean return
+                success = result
+                has_errors = False
+                has_failures = False
+                report = {}
+            
+            mode = "dry run" if dry_run else "migration"
+            
+            if not success:
+                # Complete failure - migration crashed
+                self.add_log_message(f"{mode.title()} failed. Check the logs for details.")
+            elif has_errors or has_failures:
+                # Completed but with errors/failures
+                error_count = len(report.get('errors', []))
+                total_failures = sum(
+                    stats.get('failed', 0) 
+                    for stats in report.values() 
+                    if isinstance(stats, dict) and 'failed' in stats
+                )
+                self.add_log_message(f"{mode.title()} completed with errors!")
+                if error_count > 0:
+                    self.add_log_message(f"  - {error_count} error(s) logged")
+                if total_failures > 0:
+                    self.add_log_message(f"  - {total_failures} item(s) failed to migrate")
+                self.add_log_message("  Check the output above for details.")
+            else:
+                # Complete success
+                self.add_log_message(f"{mode.title()} completed successfully!")
                 
         except Exception as e:
             self.add_log_message(f"Error during migration: {str(e)}")

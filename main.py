@@ -123,9 +123,18 @@ class MigrationGUI:
         self.dry_run_btn.grid(row=current_row, column=0, columnspan=3, sticky=(tk.W, tk.E), 
                               pady=(40, 10), padx=40, ipady=15)
         
-        self.migrate_btn = ttk.Button(parent, text="Migrate", command=self.run_migration)
-        self.migrate_btn.grid(row=current_row+1, column=0, columnspan=3, sticky=(tk.W, tk.E), 
-                              pady=10, padx=40, ipady=15)
+        # Frame for migrate and stop buttons side by side
+        migrate_frame = ttk.Frame(parent)
+        migrate_frame.grid(row=current_row+1, column=0, columnspan=3, sticky=(tk.W, tk.E), 
+                          pady=10, padx=40)
+        migrate_frame.columnconfigure(0, weight=1)
+        migrate_frame.columnconfigure(1, weight=0)
+        
+        self.migrate_btn = ttk.Button(migrate_frame, text="Migrate", command=self.run_migration)
+        self.migrate_btn.grid(row=0, column=0, sticky=(tk.W, tk.E), ipady=15)
+        
+        self.stop_btn = ttk.Button(migrate_frame, text="Stop", command=self.stop_migration, state='disabled')
+        self.stop_btn.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 0), ipady=15)
         
         # Configure column weights
         parent.columnconfigure(0, weight=0, minsize=230)  # Label column
@@ -221,11 +230,20 @@ class MigrationGUI:
         """Disable action buttons during migration"""
         self.dry_run_btn.config(state='disabled')
         self.migrate_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')  # Enable stop button
     
     def enable_buttons(self):
         """Enable action buttons after migration"""
         self.dry_run_btn.config(state='normal')
         self.migrate_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')  # Disable stop button
+    
+    def stop_migration(self):
+        """Request migration to stop gracefully"""
+        if self.migration_in_progress:
+            self.migration_engine.stop_migration()
+            self.add_log_message("STOP requested - migration will halt after current item...")
+            self.stop_btn.config(state='disabled')  # Disable to prevent multiple clicks
     
     def run_dry_run(self):
         """Run migration in dry run mode"""

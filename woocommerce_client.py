@@ -187,6 +187,33 @@ class WooCommerceClient:
             logger.error(f"Failed to update order {order_id}: {e}")
             return None
     
+    def delete_order(self, order_id, force=False):
+        """Delete an order from WooCommerce
+        
+        Args:
+            order_id: WooCommerce order ID to delete
+            force: If True, permanently delete. If False, move to trash
+            
+        Returns:
+            Deleted order object if successful, None otherwise
+        """
+        try:
+            params = {'force': 'true' if force else 'false'}
+            response = self._make_request('DELETE', f'orders/{order_id}', params=params)
+            logger.debug(f"Deleted order: {order_id}")
+            return response
+        except requests.exceptions.HTTPError as e:
+            error_text = ""
+            try:
+                error_text = e.response.text[:500] if e.response.text else "No error details"
+            except:
+                error_text = "Could not read error response"
+            logger.error(f"HTTP error deleting order {order_id}: {e.response.status_code} - {error_text}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to delete order {order_id}: {e}")
+            return None
+    
     def add_order_note(self, order_id, note_text, customer_note=False):
         """Add a note to an order
         
@@ -234,6 +261,46 @@ class WooCommerceClient:
             return None
         except Exception as e:
             logger.error(f"Failed to create coupon {coupon_data.get('code', 'Unknown')}: {e}")
+            return None
+    
+    def delete_coupon(self, coupon_id):
+        """Delete a coupon from WooCommerce"""
+        try:
+            response = self._make_request('DELETE', f'coupons/{coupon_id}', params={'force': True})
+            logger.debug(f"Deleted coupon: {coupon_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete coupon {coupon_id}: {e}")
+            return None
+    
+    def delete_order(self, order_id):
+        """Delete an order from WooCommerce"""
+        try:
+            response = self._make_request('DELETE', f'orders/{order_id}', params={'force': True})
+            logger.debug(f"Deleted order: {order_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete order {order_id}: {e}")
+            return None
+    
+    def delete_product(self, product_id):
+        """Delete a product from WooCommerce"""
+        try:
+            response = self._make_request('DELETE', f'products/{product_id}', params={'force': True})
+            logger.debug(f"Deleted product: {product_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete product {product_id}: {e}")
+            return None
+    
+    def delete_customer(self, customer_id):
+        """Delete a customer from WooCommerce"""
+        try:
+            response = self._make_request('DELETE', f'customers/{customer_id}', params={'force': True, 'reassign': 0})
+            logger.debug(f"Deleted customer: {customer_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete customer {customer_id}: {e}")
             return None
     
     def create_product_category(self, category_data):
@@ -367,6 +434,33 @@ class WooCommerceClient:
             return orders
         except Exception as e:
             logger.error(f"Failed to get existing orders: {e}")
+            return []
+    
+    def get_existing_coupons(self):
+        """Get all existing coupons"""
+        try:
+            coupons = []
+            page = 1
+            per_page = 100
+            
+            while True:
+                params = {'page': page, 'per_page': per_page}
+                response = self._make_request('GET', 'coupons', params=params)
+                
+                if not response:
+                    break
+                    
+                coupons.extend(response)
+                
+                if len(response) < per_page:
+                    break
+                    
+                page += 1
+                
+            logger.info(f"Fetched {len(coupons)} existing coupons from WooCommerce")
+            return coupons
+        except Exception as e:
+            logger.error(f"Failed to get existing coupons: {e}")
             return []
     
     def batch_create_products(self, products_data):

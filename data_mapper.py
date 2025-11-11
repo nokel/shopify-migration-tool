@@ -473,6 +473,10 @@ class DataMapper:
                     {
                         'key': 'shopify_created_at',
                         'value': shopify_order.get('created_at', '')
+                    },
+                    {
+                        'key': 'Tags',
+                        'value': shopify_order.get('tags', '')
                     }
                 ]
             }
@@ -504,6 +508,47 @@ class DataMapper:
                         'tax_total': str(tax.get('price', '0'))
                     })
             
+            # Handle discount codes as negative fee lines
+            discount_codes = shopify_order.get('discount_codes', [])
+            discount_applications = shopify_order.get('discount_applications', [])
+            total_discounts = shopify_order.get('total_discounts', '0')
+            
+            if discount_codes or discount_applications or (total_discounts and float(total_discounts) > 0):
+                wc_order['fee_lines'] = []
+                
+                # Add discount information to metadata for reference
+                if discount_applications:
+                    for i, discount_app in enumerate(discount_applications):
+                        value_type = discount_app.get('value_type', 'fixed_amount')
+                        value = discount_app.get('value', '0')
+                        title = discount_app.get('title', 'Discount')
+                        
+                        wc_order['meta_data'].append({
+                            'key': f'shopify_discount_{i+1}_title',
+                            'value': title
+                        })
+                        wc_order['meta_data'].append({
+                            'key': f'shopify_discount_{i+1}_value',
+                            'value': f"{value}{'%' if value_type == 'percentage' else ''}"
+                        })
+                        logger.debug(f"Added discount '{title}' metadata: {value}{' %' if value_type == 'percentage' else ''}")
+                
+                # Add discount as negative fee line to actually reduce the total
+                if total_discounts and float(total_discounts) > 0:
+                    wc_order['fee_lines'].append({
+                        'name': 'Discount',
+                        'total': str(-float(total_discounts)),  # Negative amount
+                        'tax_status': 'none'
+                    })
+                    logger.debug(f"Added discount fee line: -${total_discounts}")
+                    
+                    # Also add to metadata
+                    wc_order['meta_data'].append({
+                        'key': 'shopify_total_discounts',
+                        'value': str(total_discounts)
+                    })
+                    logger.debug(f"Added total discount to metadata: ${total_discounts}")
+            
             # Validate essential fields
             if not wc_order.get('line_items'):
                 logger.warning(f"Order {shopify_order.get('order_number', 'unknown')} has no line items, skipping")
@@ -520,6 +565,23 @@ class DataMapper:
     def map_coupon(shopify_discount):
         """Map Shopify discount code to WooCommerce coupon"""
         try:
+            # Extract coupon code - MUST NOT be empty
+            coupon_code = shopify_discount.get('code', '').strip()
+            
+            if not coupon_code:
+                # Try title as fallback
+                coupon_code = shopify_discount.get('title', '').strip()
+            
+            if not coupon_code:
+                # Last resort - generate from ID
+                discount_id = shopify_discount.get('id', shopify_discount.get('discount_code_id', ''))
+                coupon_code = f"DISCOUNT_{discount_id}" if discount_id else None
+            
+            # Validate we have a code
+            if not coupon_code:
+                logger.error(f"Cannot map discount - no code available: {shopify_discount}")
+                return None
+            
             # Map discount type
             discount_type_map = {
                 'percentage': 'percent',
@@ -527,22 +589,40 @@ class DataMapper:
                 'shipping': 'fixed_cart'
             }
             
+            # Get discount value - Shopify stores as negative, WooCommerce expects positive
+            discount_value = shopify_discount.get('value', '0')
+            try:
+                discount_value = abs(float(discount_value))
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid discount value '{discount_value}' for coupon {coupon_code}, using 0")
+                discount_value = 0
+            
+            # Get prerequisite minimum amount
+            prerequisite_subtotal = shopify_discount.get('prerequisite_subtotal_range', {})
+            min_amount = '0'
+            if prerequisite_subtotal and isinstance(prerequisite_subtotal, dict):
+                min_amount = prerequisite_subtotal.get('greater_than_or_equal_to', '0')
+            
             wc_coupon = {
-                'code': shopify_discount.get('code', ''),
+                'code': coupon_code,
                 'discount_type': discount_type_map.get(shopify_discount.get('value_type'), 'fixed_cart'),
-                'amount': str(shopify_discount.get('value', '0')),
+                'amount': str(discount_value),
                 'individual_use': not shopify_discount.get('applies_to_shipping', False),
                 'exclude_sale_items': False,
-                'minimum_amount': str(shopify_discount.get('minimum_order_amount', '0')),
+                'minimum_amount': str(min_amount),
                 'usage_limit': shopify_discount.get('usage_limit'),
-                'usage_count': shopify_discount.get('used_count', 0),
+                'usage_count': shopify_discount.get('usage_count', 0),
                 'date_expires': shopify_discount.get('ends_at'),
                 'free_shipping': shopify_discount.get('applies_to_shipping', False),
-                'description': f"Migrated from Shopify discount: {shopify_discount.get('code', '')}",
+                'description': f"Migrated from Shopify: {shopify_discount.get('title', coupon_code)}",
                 'meta_data': [
                     {
-                        'key': 'shopify_discount_id',
+                        'key': 'shopify_price_rule_id',
                         'value': str(shopify_discount.get('id', ''))
+                    },
+                    {
+                        'key': 'shopify_discount_code_id',
+                        'value': str(shopify_discount.get('discount_code_id', ''))
                     }
                 ]
             }
@@ -637,22 +717,24 @@ class DataMapper:
     def map_page(shopify_page):
         """Map Shopify page to WordPress format"""
         try:
+            # WordPress REST API requires 'raw' format for HTML content when creating
+            # Using object with 'raw' key ensures HTML is preserved correctly
+            title = shopify_page.get('title', '')
+            content = shopify_page.get('body_html', '')
+            
             wp_page = {
-                'title': {
-                    'rendered': shopify_page.get('title', '')
-                },
-                'content': {
-                    'rendered': shopify_page.get('body_html', '')
-                },
+                'title': title if title else 'Untitled Page',
+                'content': content if content else '',
                 'slug': shopify_page.get('handle', ''),
                 'status': 'publish' if shopify_page.get('published_at') else 'draft',
-                'type': 'page',
                 'meta': {
                     'shopify_page_id': str(shopify_page.get('id', '')),
                     'shopify_created_at': shopify_page.get('created_at', ''),
                     'shopify_updated_at': shopify_page.get('updated_at', '')
                 }
             }
+            
+            logger.debug(f"Mapped page: title={title[:50]}, content_length={len(content)}")
             
             return wp_page
             
@@ -664,19 +746,16 @@ class DataMapper:
     def map_blog_article(shopify_article):
         """Map Shopify blog article to WordPress post format"""
         try:
+            # WordPress REST API requires HTML content to be sent properly
+            title = shopify_article.get('title', '')
+            content = shopify_article.get('body_html', '')
+            
             wp_post = {
-                'title': {
-                    'rendered': shopify_article.get('title', '')
-                },
-                'content': {
-                    'rendered': shopify_article.get('body_html', '')
-                },
+                'title': title if title else 'Untitled Post',
+                'content': content if content else '',
                 'slug': shopify_article.get('handle', ''),
                 'status': 'publish' if shopify_article.get('published_at') else 'draft',
-                'type': 'post',
-                'excerpt': {
-                    'rendered': shopify_article.get('summary', '')
-                },
+                'excerpt': shopify_article.get('summary', ''),
                 'meta': {
                     'shopify_article_id': str(shopify_article.get('id', '')),
                     'shopify_blog_id': str(shopify_article.get('blog_id', '')),
@@ -692,6 +771,8 @@ class DataMapper:
             # Handle tags
             if shopify_article.get('tags'):
                 wp_post['meta']['shopify_tags'] = shopify_article.get('tags')
+            
+            logger.debug(f"Mapped article: title={title[:50]}, content_length={len(content)}")
             
             return wp_post
             

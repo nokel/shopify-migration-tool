@@ -22,6 +22,7 @@ class MigrationEngine:
         self.woocommerce = None
         self.wordpress = None
         self.image_manager = None
+        self.stop_requested = False  # Flag to stop migration
         self.migration_report = {
             'start_time': None,
             'end_time': None,
@@ -43,7 +44,9 @@ class MigrationEngine:
         self.existing_products = []
         self.existing_categories = []
         self.existing_pages = []
+        self.existing_posts = []
         self.existing_orders = []
+        self.existing_coupons = []
         self.used_placeholder_emails = set()  # Track generated placeholder emails
         
     def log(self, message, level='INFO'):
@@ -118,33 +121,62 @@ class MigrationEngine:
             self.log(f"Failed to connect to APIs: {e}", 'ERROR')
             return False
 
+    def stop_migration(self):
+        """Request migration to stop gracefully"""
+        self.stop_requested = True
+        self.log("STOP REQUESTED - Migration will halt after current item", 'WARNING')
+    
     def run_migration(self, dry_run=False):
         """Run the complete migration process with CLEAN counting"""
         try:
+            self.stop_requested = False  # Reset stop flag at start
             self.migration_report['start_time'] = datetime.now()
             mode_text = "DRY RUN" if dry_run else "LIVE MIGRATION"
             self.log(f"Starting {mode_text}...")
             
             # Get existing data for duplicate detection
             self.update_progress(2, "Checking existing WooCommerce data...")
+            if self.stop_requested:
+                self.log("Migration stopped by user", 'WARNING')
+                return self._finalize_migration_report(dry_run, stopped=True)
+            
             self.existing_customers = self.woocommerce.get_existing_customers()
             self.existing_products = self.woocommerce.get_existing_products()
             self.existing_categories = self.woocommerce.get_existing_categories()
             self.existing_orders = self.woocommerce.get_existing_orders()
+            self.existing_coupons = self.woocommerce.get_existing_coupons()
+            
             if self.wordpress:
                 self.existing_pages = self.wordpress.get_existing_pages()
+                self.existing_posts = self.wordpress.get_existing_posts()
             
-            self.log(f"[{mode_text}] Found {len(self.existing_customers)} existing customers, {len(self.existing_products)} existing products, {len(self.existing_categories)} existing categories, {len(self.existing_orders)} existing orders, {len(self.existing_pages)} existing pages")
+            self.log(f"[{mode_text}] Found {len(self.existing_customers)} existing customers, {len(self.existing_products)} existing products, {len(self.existing_categories)} existing categories, {len(self.existing_orders)} existing orders, {len(self.existing_coupons)} existing coupons, {len(self.existing_pages)} existing pages, {len(self.existing_posts)} existing posts")
             
             # Run migration phases with clean counting
+            if self.stop_requested:
+                self.log("Migration stopped by user", 'WARNING')
+                return self._finalize_migration_report(dry_run, stopped=True)
+            
             self.update_progress(5, "Migrating categories...")
             self._migrate_categories_clean(dry_run)
+            
+            if self.stop_requested:
+                self.log("Migration stopped by user", 'WARNING')
+                return self._finalize_migration_report(dry_run, stopped=True)
             
             self.update_progress(20, "Migrating products...")
             self._migrate_products_clean(dry_run)
             
+            if self.stop_requested:
+                self.log("Migration stopped by user", 'WARNING')
+                return self._finalize_migration_report(dry_run, stopped=True)
+            
             self.update_progress(50, "Migrating customers...")
             self._migrate_customers_clean(dry_run)
+            
+            if self.stop_requested:
+                self.log("Migration stopped by user", 'WARNING')
+                return self._finalize_migration_report(dry_run, stopped=True)
             
             self.update_progress(70, "Migrating orders...")
             self._migrate_orders_clean(dry_run)
@@ -155,30 +187,8 @@ class MigrationEngine:
             self.update_progress(95, "Migrating pages...")
             self._migrate_pages_clean(dry_run)
             
-            self.migration_report['end_time'] = datetime.now()
-            
-            # Determine completion status based on errors and failures
-            has_errors = len(self.migration_report['errors']) > 0
-            has_failures = any(
-                stats.get('failed', 0) > 0 
-                for stats in self.migration_report.values() 
-                if isinstance(stats, dict) and 'failed' in stats
-            )
-            
-            if has_errors or has_failures:
-                self.update_progress(100, "Migration completed with errors!")
-            else:
-                self.update_progress(100, "Migration completed successfully!")
-            
-            self._generate_migration_report(dry_run)
-            
-            # Return dictionary with status information
-            return {
-                'success': True,  # Migration didn't crash
-                'has_errors': has_errors,
-                'has_failures': has_failures,
-                'report': self.migration_report
-            }
+            # Finalize and generate report
+            return self._finalize_migration_report(dry_run, stopped=False)
             
         except Exception as e:
             self.log(f"Migration failed: {e}", 'ERROR')
@@ -202,6 +212,11 @@ class MigrationEngine:
             self.log(f"Found {attempted} categories to migrate")
             
             for collection in collections:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Category migration stopped by user", 'WARNING')
+                    break
+                
                 success = False
                 error_msg = None
                 
@@ -310,6 +325,11 @@ class MigrationEngine:
             self.log(f"Found {attempted} customers to migrate")
             
             for customer in customers:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Customer migration stopped by user", 'WARNING')
+                    break
+                
                 success = False
                 error_msg = None
                 
@@ -369,6 +389,34 @@ class MigrationEngine:
     def _find_existing_customer(self, email):
         """Find existing WooCommerce customer by email"""
         return next((c for c in self.existing_customers if c.get('email') == email), None)
+    
+    def _find_existing_coupon(self, code):
+        """Find existing WooCommerce coupon by code"""
+        return next((c for c in self.existing_coupons if c.get('code', '').lower() == code.lower()), None)
+    
+    def _find_existing_page(self, title, slug):
+        """Find existing WordPress page by title or slug"""
+        if title:
+            existing = next((p for p in self.existing_pages if p.get('title', {}).get('rendered') == title), None)
+            if existing:
+                return existing
+        if slug:
+            existing = next((p for p in self.existing_pages if p.get('slug') == slug), None)
+            if existing:
+                return existing
+        return None
+    
+    def _find_existing_post(self, title, slug):
+        """Find existing WordPress post by title or slug"""
+        if title:
+            existing = next((p for p in self.existing_posts if p.get('title', {}).get('rendered') == title), None)
+            if existing:
+                return existing
+        if slug:
+            existing = next((p for p in self.existing_posts if p.get('slug') == slug), None)
+            if existing:
+                return existing
+        return None
 
     def _migrate_products_clean(self, dry_run=False):
         """Clean product migration with two-phase approach (products first, then images)"""
@@ -383,6 +431,11 @@ class MigrationEngine:
             
             # Phase 1: Create products WITHOUT images to avoid timeout
             for product in products:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Product migration stopped by user", 'WARNING')
+                    break
+                
                 success = False
                 error_msg = None
                 
@@ -409,6 +462,8 @@ class MigrationEngine:
                             if images:
                                 # Check if existing product has images
                                 existing_images = existing.get('images', [])
+                                self.log(f"Product '{product_name}' has {len(existing_images)} existing images", 'DEBUG')
+                                
                                 if len(existing_images) == 0:
                                     # Product exists but has no images - add to image processing queue
                                     mapped_product = DataMapper.map_product(product)
@@ -420,7 +475,9 @@ class MigrationEngine:
                                                 'name': product_name,
                                                 'images': product_images
                                             })
-                                            self.log(f"Existing product '{product_name}' has no images - will add them")
+                                            self.log(f"Existing product '{product_name}' has no images - will add {len(product_images)} images")
+                                else:
+                                    self.log(f"Product '{product_name}' already has images - skipping image processing", 'DEBUG')
                     else:
                         # Map product data
                         mapped_product = DataMapper.map_product(product)
@@ -481,6 +538,11 @@ class MigrationEngine:
                 images_failed = 0
                 
                 for item in products_with_images:
+                    # Check for stop request
+                    if self.stop_requested:
+                        self.log("Image processing stopped by user", 'WARNING')
+                        break
+                    
                     try:
                         product_name = item['name']
                         shopify_images = item['images']
@@ -550,41 +612,9 @@ class MigrationEngine:
         Returns:
             Boolean indicating if update is needed
         """
-        # Compare key fields that might change
-        fields_to_compare = [
-            'status',
-            'total',
-            'subtotal', 
-            'total_tax',
-            'shipping_total',
-            'discount_total'
-        ]
-        
-        for field in fields_to_compare:
-            existing_val = str(existing_order.get(field, ''))
-            new_val = str(new_order_data.get(field, ''))
-            if existing_val != new_val:
-                self.log(f"Order field '{field}' changed: '{existing_val}' → '{new_val}'", 'DEBUG')
-                return True
-        
-        # Compare line items count
-        existing_items = len(existing_order.get('line_items', []))
-        new_items = len(new_order_data.get('line_items', []))
-        if existing_items != new_items:
-            self.log(f"Line items count changed: {existing_items} → {new_items}", 'DEBUG')
-            return True
-        
-        # Compare line item quantities and totals
-        for i, (existing_item, new_item) in enumerate(zip(
-            existing_order.get('line_items', []),
-            new_order_data.get('line_items', [])
-        )):
-            if str(existing_item.get('quantity')) != str(new_item.get('quantity')):
-                return True
-            if str(existing_item.get('total')) != str(new_item.get('total')):
-                return True
-        
-        # No meaningful differences found
+        # Don't update orders - they rarely change after creation
+        # Updating causes issues with line items being duplicated
+        # Only create new orders, skip existing ones
         return False
 
     def _migrate_orders_clean(self, dry_run=False):
@@ -600,6 +630,11 @@ class MigrationEngine:
             self.log(f"Found {attempted} orders to migrate")
             
             for order in orders:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Order migration stopped by user", 'WARNING')
+                    break
+                
                 success = False
                 error_msg = None
                 is_update = False
@@ -647,12 +682,13 @@ class MigrationEngine:
                                 if self._order_needs_update(existing_order, wc_order):
                                     self.log(f"Order {order_number} has changes, updating... (WC ID: {wc_order_id})")
                                     
-                                    # IMPORTANT: Remove line_items and shipping_lines from update to prevent duplication
+                                    # IMPORTANT: Remove line_items, shipping_lines, and fee_lines from update to prevent duplication
                                     # WooCommerce API appends these on update instead of replacing
-                                    # Only update order-level fields, not line items or shipping
+                                    # Only update order-level fields, not line items, shipping, or discounts
                                     update_data = wc_order.copy()
                                     update_data.pop('line_items', None)
                                     update_data.pop('shipping_lines', None)
+                                    update_data.pop('fee_lines', None)  # Prevents duplicate discount entries
                                     
                                     # Update the order
                                     result = self.woocommerce.update_order(wc_order_id, update_data)
@@ -735,13 +771,12 @@ class MigrationEngine:
             self.log(f"Error in order migration: {e}", 'ERROR')
 
     def _migrate_order_notes(self, wc_order_id, shopify_order, wc_order=None):
-        """Migrate Shopify order notes to WooCommerce as private notes
+        """Migrate Shopify order notes and timeline events to WooCommerce
         
-        Handles both:
-        1. Standard Shopify order notes (from 'note' field)
+        Handles:
+        1. Complete timeline events from Shopify (GraphQL/REST API)
         2. Job notes stored as $0 line items (extracted during mapping)
-        
-        Detects embedded images in notes and adds a placeholder note instead.
+        3. Standard Shopify order notes (from 'note' field)
         
         Args:
             wc_order_id: WooCommerce order ID
@@ -750,9 +785,38 @@ class MigrationEngine:
         """
         try:
             import re
+            from datetime import datetime
             notes_added = 0
             
-            # First, handle job notes from $0 line items (if any)
+            shopify_order_id = shopify_order.get('id')
+            
+            # First, migrate complete timeline events
+            self.log(f"Fetching timeline events for order {shopify_order.get('order_number')}...")
+            timeline_events = self.shopify.get_order_timeline_events(shopify_order_id)
+            
+            if timeline_events:
+                # Merge "added a note" events with actual note content
+                timeline_events = self.shopify.merge_note_events(timeline_events)
+                self.log(f"Found {len(timeline_events)} timeline events")
+                
+                # Add each timeline event as a note (oldest first for chronological order)
+                for event in timeline_events:
+                    note_text = self._format_timeline_note(event)
+                    
+                    result = self.woocommerce.add_order_note(
+                        wc_order_id,
+                        note_text,
+                        customer_note=False
+                    )
+                    
+                    if result:
+                        notes_added += 1
+                    else:
+                        self.log(f"Failed to add timeline event to order {wc_order_id}", 'WARNING')
+            else:
+                self.log(f"No timeline events found for order {shopify_order.get('order_number')}", 'WARNING')
+            
+            # Then, handle job notes from $0 line items (if any)
             if wc_order and '_job_notes' in wc_order:
                 job_notes = wc_order.get('_job_notes', [])
                 for job_note in job_notes:
@@ -767,11 +831,10 @@ class MigrationEngine:
                         
                         if result:
                             notes_added += 1
-                            self.log(f"Added job note to WC order {wc_order_id}")
                         else:
-                            self.log(f"Failed to add job note to WC order {wc_order_id}", 'ERROR')
+                            self.log(f"Failed to add job note to order {wc_order_id}", 'WARNING')
             
-            # Then, handle standard Shopify order note
+            # Finally, handle standard Shopify order note (if exists and not already in timeline)
             shopify_note = shopify_order.get('note')
             
             if shopify_note and shopify_note.strip():
@@ -781,13 +844,9 @@ class MigrationEngine:
                 has_image_url = re.search(r'\.(jpg|jpeg|png|gif|webp)', shopify_note.lower())
                 
                 if has_img_tag or has_cdn or has_image_url:
-                    # Note contains images - strip them and add placeholder
-                    # Remove HTML img tags
                     clean_note = re.sub(r'<img[^>]*>', '', shopify_note, flags=re.IGNORECASE)
-                    # Remove standalone image URLs
                     clean_note = re.sub(r'https?://[^\s]*\.(jpg|jpeg|png|gif|webp)', '[image removed]', clean_note, flags=re.IGNORECASE)
                     
-                    # Add note about images being removed
                     note_text = "Shopify Order Note:\n"
                     note_text += "[NOTE: Pictures were attached in the original Shopify order notes]\n\n"
                     if clean_note.strip():
@@ -797,10 +856,8 @@ class MigrationEngine:
                     
                     self.log(f"Order note contains images - they will be stripped", 'WARNING')
                 else:
-                    # Normal note without images
                     note_text = f"Shopify Order Note:\n{shopify_note}"
                 
-                # Add as private note (not visible to customer)
                 result = self.woocommerce.add_order_note(
                     wc_order_id,
                     note_text,
@@ -809,15 +866,61 @@ class MigrationEngine:
                 
                 if result:
                     notes_added += 1
-                    self.log(f"Added order note to WC order {wc_order_id}")
-                else:
-                    self.log(f"Failed to add note to WC order {wc_order_id}", 'ERROR')
             
             if notes_added > 0:
                 self.log(f"Added {notes_added} note(s) to order {wc_order_id}")
         
         except Exception as e:
             self.log(f"Error migrating notes for order {wc_order_id}: {e}", 'ERROR')
+            self.migration_report['errors'].append(f"Failed to migrate notes for order {wc_order_id}: {e}")
+    
+    def _format_timeline_note(self, event):
+        """Format timeline event as WooCommerce note
+        
+        Format: [DD/MM/YY H:MMam/pm] Message
+        For staff notes: [DD/MM/YY H:MMam/pm] NOTE: Author: Message
+        
+        Args:
+            event: Dict with 'created_at', 'message', 'event_type', 'author'
+            
+        Returns:
+            Formatted note string
+        """
+        timestamp_str = event.get('created_at', '')
+        
+        try:
+            # Parse ISO format timestamp
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            
+            # Format as DD/MM/YY H:MMam/pm
+            day = dt.strftime('%d')
+            month = dt.strftime('%m')
+            year = dt.strftime('%y')
+            
+            # Format time as H:MMam/pm (remove leading zero from hour)
+            hour = dt.strftime('%I').lstrip('0')
+            minute = dt.strftime('%M')
+            ampm = dt.strftime('%p').lower()
+            time = f"{hour}:{minute}{ampm}"
+            
+            formatted_time = f"[{day}/{month}/{year} {time}]"
+        except Exception as e:
+            # Fallback if parsing fails
+            formatted_time = f"[{timestamp_str}]"
+        
+        # Get message
+        message = event.get('message', '').strip()
+        
+        # Format based on event type
+        event_type = event.get('event_type', 'Event')
+        author = event.get('author')
+        
+        if event_type == 'CommentEvent' and author:
+            # Staff comment format
+            return f"{formatted_time} NOTE: {author}: {message}"
+        else:
+            # System event format
+            return f"{formatted_time} {message}"
     
     def _map_order_line_items(self, wc_order, shopify_order):
         """Map Shopify line items to WooCommerce products
@@ -869,31 +972,251 @@ class MigrationEngine:
                 self.log(f"Line item '{item.get('name')}' will be added as custom/unlisted item (no matching product)", 'INFO')
 
     def _migrate_coupons_clean(self, dry_run=False):
-        """Clean coupon migration - simplified for now"""
-        discounts = self.shopify.get_discounts()
-        
-        self.migration_report['coupons']['attempted'] = len(discounts)
-        self.migration_report['coupons']['successful'] = len(discounts) if dry_run else 0
-        self.migration_report['coupons']['failed'] = 0 if dry_run else len(discounts)
-        
-        self.log(f"Coupons: {len(discounts)} found (simplified migration for testing)")
+        """Clean coupon migration with single counting point"""
+        try:
+            discounts = self.shopify.get_discounts()
+            attempted = len(discounts)
+            successful = 0
+            failed = 0
+            
+            self.log(f"Found {attempted} coupons to migrate")
+            
+            for discount in discounts:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Coupon migration stopped by user", 'WARNING')
+                    break
+                
+                success = False
+                error_msg = None
+                
+                try:
+                    # Map the discount first (includes validation)
+                    wc_coupon = DataMapper.map_coupon(discount)
+                    
+                    if not wc_coupon:
+                        error_msg = f"Failed to map discount (ID: {discount.get('id', 'unknown')}) - invalid data or missing code"
+                    else:
+                        coupon_code = wc_coupon.get('code', '')
+                        
+                        # Check if already exists
+                        existing = self._find_existing_coupon(coupon_code)
+                        
+                        if existing:
+                            mode_text = "DRY RUN" if dry_run else "LIVE"
+                            self.log(f"[{mode_text}] Skipped existing coupon: {coupon_code}")
+                            success = True
+                        elif dry_run:
+                            self.log(f"[DRY RUN] Would create coupon: {coupon_code}")
+                            success = True
+                        else:
+                            # Create new coupon
+                            result = self.woocommerce.create_coupon(wc_coupon)
+                            if result:
+                                self.log(f"Created coupon: {coupon_code}")
+                                success = True
+                            else:
+                                error_msg = f"Failed to create coupon: {coupon_code}"
+                            
+                except Exception as e:
+                    error_msg = f"Error processing coupon (ID: {discount.get('id', 'unknown')}): {e}"
+                
+                # SINGLE counting point
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+                    if error_msg:
+                        self.log(error_msg, 'ERROR')
+                        self.migration_report['errors'].append(error_msg)
+            
+            # Set final counts ONCE
+            self.migration_report['coupons']['attempted'] = attempted
+            self.migration_report['coupons']['successful'] = successful
+            self.migration_report['coupons']['failed'] = failed
+            
+            self.log(f"Coupons: {successful}/{attempted} successful, {failed} failed")
+            
+        except Exception as e:
+            self.log(f"Error in coupon migration: {e}", 'ERROR')
+            self.migration_report['errors'].append(f"Coupon migration: {str(e)}")
 
     def _migrate_pages_clean(self, dry_run=False):
-        """Clean page migration - simplified for now"""
-        pages = self.shopify.get_pages()
-        blogs = self.shopify.get_blogs()
-        articles = []
-        for blog in blogs:
-            articles.extend(self.shopify.get_blog_articles(blog.get('id')))
-        
-        total = len(pages) + len(articles)
-        
-        self.migration_report['pages']['attempted'] = total
-        self.migration_report['pages']['successful'] = total if dry_run and self.wordpress else 0
-        self.migration_report['pages']['failed'] = 0 if (dry_run and self.wordpress) else total
-        
-        self.log(f"Pages: {total} found (simplified migration for testing)")
+        """Clean page and blog post migration with single counting point"""
+        try:
+            if not self.wordpress:
+                self.log("Pages: Skipped (WordPress credentials not configured)")
+                self.migration_report['pages']['attempted'] = 0
+                self.migration_report['pages']['successful'] = 0
+                self.migration_report['pages']['failed'] = 0
+                return
+            
+            # Get all pages and articles
+            pages = self.shopify.get_pages()
+            blogs = self.shopify.get_blogs()
+            articles = []
+            for blog in blogs:
+                articles.extend(self.shopify.get_blog_articles(blog.get('id')))
+            
+            attempted = len(pages) + len(articles)
+            successful = 0
+            failed = 0
+            
+            self.log(f"Found {len(pages)} pages and {len(articles)} blog posts to migrate")
+            
+            # Migrate pages
+            for page in pages:
+                # Check for stop request
+                if self.stop_requested:
+                    self.log("Page migration stopped by user", 'WARNING')
+                    break
+                
+                success = False
+                error_msg = None
+                
+                try:
+                    page_title = page.get('title', 'Unknown')
+                    page_slug = page.get('handle', '')
+                    
+                    # Check if already exists
+                    existing = self._find_existing_page(page_title, page_slug)
+                    
+                    if existing:
+                        mode_text = "DRY RUN" if dry_run else "LIVE"
+                        self.log(f"[{mode_text}] Skipped existing page: {page_title}")
+                        success = True
+                    elif dry_run:
+                        self.log(f"[DRY RUN] Would create page: {page_title}")
+                        success = True
+                    else:
+                        # Map and create new page
+                        wp_page = DataMapper.map_page(page)
+                        if wp_page:
+                            result = self.wordpress.create_page(wp_page)
+                            if result:
+                                self.log(f"Created page: {page_title}")
+                                success = True
+                            else:
+                                error_msg = f"Failed to create page: {page_title}"
+                        else:
+                            error_msg = f"Failed to map page: {page_title}"
+                            
+                except Exception as e:
+                    error_msg = f"Error processing page {page.get('title', 'unknown')}: {e}"
+                
+                # SINGLE counting point
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+                    if error_msg:
+                        self.log(error_msg, 'ERROR')
+                        self.migration_report['errors'].append(error_msg)
+            
+            # Migrate blog articles (if not stopped)
+            if not self.stop_requested:
+                for article in articles:
+                    # Check for stop request
+                    if self.stop_requested:
+                        self.log("Blog post migration stopped by user", 'WARNING')
+                        break
+                    
+                    success = False
+                    error_msg = None
+                    
+                    try:
+                        article_title = article.get('title', 'Unknown')
+                        article_slug = article.get('handle', '')
+                        
+                        # Check if already exists
+                        existing = self._find_existing_post(article_title, article_slug)
+                        
+                        if existing:
+                            mode_text = "DRY RUN" if dry_run else "LIVE"
+                            self.log(f"[{mode_text}] Skipped existing post: {article_title}")
+                            success = True
+                        elif dry_run:
+                            self.log(f"[DRY RUN] Would create post: {article_title}")
+                            success = True
+                        else:
+                            # Map and create new post
+                            wp_post = DataMapper.map_blog_article(article)
+                            if wp_post:
+                                result = self.wordpress.create_post(wp_post)
+                                if result:
+                                    self.log(f"Created blog post: {article_title}")
+                                    success = True
+                                else:
+                                    error_msg = f"Failed to create post: {article_title}"
+                            else:
+                                error_msg = f"Failed to map post: {article_title}"
+                                
+                    except Exception as e:
+                        error_msg = f"Error processing article {article.get('title', 'unknown')}: {e}"
+                    
+                    # SINGLE counting point
+                    if success:
+                        successful += 1
+                    else:
+                        failed += 1
+                        if error_msg:
+                            self.log(error_msg, 'ERROR')
+                            self.migration_report['errors'].append(error_msg)
+            
+            # Set final counts ONCE
+            self.migration_report['pages']['attempted'] = attempted
+            self.migration_report['pages']['successful'] = successful
+            self.migration_report['pages']['failed'] = failed
+            
+            self.log(f"Pages/Posts: {successful}/{attempted} successful, {failed} failed")
+            
+        except Exception as e:
+            self.log(f"Error in page/post migration: {e}", 'ERROR')
+            self.migration_report['errors'].append(f"Page/post migration: {str(e)}")
 
+    def _finalize_migration_report(self, dry_run=False, stopped=False):
+        """Finalize migration when stopped or completed early"""
+        self.migration_report['end_time'] = datetime.now()
+        
+        # Determine completion status based on errors and failures
+        has_errors = len(self.migration_report['errors']) > 0
+        has_failures = any(
+            stats.get('failed', 0) > 0 
+            for stats in self.migration_report.values() 
+            if isinstance(stats, dict) and 'failed' in stats
+        )
+        
+        if stopped:
+            self.update_progress(100, "Migration stopped by user")
+            self.log("Migration was stopped by user", 'WARNING')
+        elif has_errors or has_failures:
+            self.update_progress(100, "Migration completed with errors!")
+        else:
+            self.update_progress(100, "Migration completed successfully!")
+        
+        self._generate_migration_report(dry_run)
+        
+        # Cleanup logs after 2 seconds
+        try:
+            from logger import cleanup_old_logs
+            import threading
+            def delayed_cleanup():
+                time.sleep(2)
+                cleanup_old_logs()
+            cleanup_thread = threading.Thread(target=delayed_cleanup, daemon=True)
+            cleanup_thread.start()
+        except Exception:
+            pass
+        
+        # Return dictionary with status information
+        return {
+            'success': not stopped,  # False if stopped, True otherwise
+            'stopped': stopped,
+            'has_errors': has_errors,
+            'has_failures': has_failures,
+            'report': self.migration_report
+        }
+    
     def _generate_migration_report(self, dry_run=False):
         """Generate and save migration report"""
         mode = "DRY RUN" if dry_run else "MIGRATION"
@@ -904,6 +1227,10 @@ class MigrationEngine:
         
         for category, stats in self.migration_report.items():
             if isinstance(stats, dict) and 'attempted' in stats:
+                # Skip categories that weren't attempted (0 attempted = not implemented)
+                if stats['attempted'] == 0:
+                    continue
+                    
                 success_rate = (stats['successful'] / stats['attempted'] * 100) if stats['attempted'] > 0 else 0
                 self.log(f"{category.upper()}: {stats['successful']}/{stats['attempted']} ({success_rate:.1f}% success)")
                 if category == 'products' and 'variants' in stats:

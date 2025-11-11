@@ -72,15 +72,22 @@ class WordPressClient:
     def create_page(self, page_data):
         """Create a WordPress page"""
         try:
+            # Log what we're sending for debugging
+            title = page_data.get('title', 'Unknown')
+            content_length = len(page_data.get('content', ''))
+            logger.info(f"Creating page: title='{title}' content_length={content_length}")
+            logger.debug(f"Page data: {page_data}")
+            
             response = self._make_request('POST', 'pages', json=page_data)
             if response:
-                logger.debug(f"Created page: {page_data.get('title', {}).get('rendered', 'Unknown')}")
+                logger.info(f"Created page: {title}")
             return response
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error creating page: {e.response.status_code} - {e.response.text}")
             return None
         except Exception as e:
-            logger.error(f"Failed to create page {page_data.get('title', 'Unknown')}: {e}")
+            title = page_data.get('title', 'Unknown')
+            logger.error(f"Failed to create page {title}: {e}")
             return None
     
     def create_post(self, post_data):
@@ -88,24 +95,101 @@ class WordPressClient:
         try:
             response = self._make_request('POST', 'posts', json=post_data)
             if response:
-                logger.debug(f"Created post: {post_data.get('title', {}).get('rendered', 'Unknown')}")
+                title = post_data.get('title', 'Unknown')
+                logger.debug(f"Created post: {title}")
             return response
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error creating post: {e.response.status_code} - {e.response.text}")
             return None
         except Exception as e:
-            logger.error(f"Failed to create post {post_data.get('title', 'Unknown')}: {e}")
+            title = post_data.get('title', 'Unknown')
+            logger.error(f"Failed to create post {title}: {e}")
+            return None
+    
+    def delete_page(self, page_id):
+        """Delete a WordPress page"""
+        try:
+            response = self._make_request('DELETE', f'pages/{page_id}', params={'force': True})
+            logger.debug(f"Deleted page: {page_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete page {page_id}: {e}")
+            return None
+    
+    def delete_post(self, post_id):
+        """Delete a WordPress post"""
+        try:
+            response = self._make_request('DELETE', f'posts/{post_id}', params={'force': True})
+            logger.debug(f"Deleted post: {post_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete post {post_id}: {e}")
+            return None
+    
+    def get_existing_media(self):
+        """Get all existing media items"""
+        try:
+            media = []
+            page = 1
+            per_page = 100
+            
+            while True:
+                params = {
+                    'page': page,
+                    'per_page': per_page,
+                    'status': 'inherit'  # Media uses 'inherit' status
+                }
+                response = self._make_request('GET', 'media', params=params)
+                
+                if not response:
+                    break
+                    
+                media.extend(response)
+                
+                if len(response) < per_page:
+                    break
+                    
+                page += 1
+                
+            return media
+        except Exception as e:
+            logger.error(f"Failed to get existing media: {e}")
+            return []
+    
+    def get_media(self, page=1, per_page=100):
+        """Get media items from WordPress media library"""
+        try:
+            params = {'page': page, 'per_page': per_page}
+            response = self._make_request('GET', 'media', params=params)
+            return response if response else []
+        except Exception as e:
+            logger.error(f"Failed to get media (page {page}): {e}")
+            return []
+    
+    def delete_media(self, media_id):
+        """Delete a WordPress media item"""
+        try:
+            response = self._make_request('DELETE', f'media/{media_id}', params={'force': True})
+            logger.debug(f"Deleted media: {media_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to delete media {media_id}: {e}")
             return None
     
     def get_existing_pages(self):
-        """Get all existing pages"""
+        """Get all existing pages (all statuses)"""
         try:
             pages = []
             page = 1
             per_page = 100
             
             while True:
-                params = {'page': page, 'per_page': per_page}
+                # Include all statuses: publish, draft, pending, private
+                params = {
+                    'page': page, 
+                    'per_page': per_page,
+                    'status': 'publish,draft,pending,private'
+                }
                 response = self._make_request('GET', 'pages', params=params)
                 
                 if not response:
@@ -124,14 +208,19 @@ class WordPressClient:
             return []
     
     def get_existing_posts(self):
-        """Get all existing posts"""
+        """Get all existing posts (all statuses)"""
         try:
             posts = []
             page = 1
             per_page = 100
             
             while True:
-                params = {'page': page, 'per_page': per_page}
+                # Include all statuses: publish, draft, pending, private
+                params = {
+                    'page': page, 
+                    'per_page': per_page,
+                    'status': 'publish,draft,pending,private'
+                }
                 response = self._make_request('GET', 'posts', params=params)
                 
                 if not response:

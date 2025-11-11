@@ -105,13 +105,19 @@ class ImageManager:
                 logger.error(f"Image file not found: {filepath}")
                 return None
             
+            # Prepare file for upload
+            filename = filepath.name
+            
+            # Check if image already exists in media library by filename
+            existing_media = self._find_existing_media(filename)
+            if existing_media:
+                logger.info(f"Image already exists in media library: {filename} (ID: {existing_media['id']})")
+                return existing_media
+            
             # Determine MIME type
             mime_type, _ = mimetypes.guess_type(str(filepath))
             if not mime_type:
                 mime_type = 'image/jpeg'
-            
-            # Prepare file for upload
-            filename = filepath.name
             
             # Read file content
             with open(filepath, 'rb') as f:
@@ -198,7 +204,7 @@ class ImageManager:
                     logger.warning(f"Skipping image {idx} for {product_name} - download failed")
                     continue
                 
-                # Upload to WordPress
+                # Upload to WordPress (will check for existing first)
                 wp_image = self.upload_to_wordpress(
                     local_path,
                     alt_text=alt_text,
@@ -207,8 +213,16 @@ class ImageManager:
                 
                 if wp_image:
                     wordpress_images.append(wp_image)
+                    logger.debug(f"Image {idx} for {product_name} ready (ID: {wp_image.get('id')})")
                 else:
-                    logger.warning(f"Skipping image {idx} for {product_name} - upload failed")
+                    # Upload failed - check if it exists in media library anyway
+                    filename = Path(local_path).name
+                    existing = self._find_existing_media(filename)
+                    if existing:
+                        logger.info(f"Upload failed but found existing image for {product_name} - using existing (ID: {existing.get('id')})")
+                        wordpress_images.append(existing)
+                    else:
+                        logger.warning(f"Skipping image {idx} for {product_name} - upload failed and not found in media library")
                 
                 # Small delay between uploads to avoid overwhelming server
                 time.sleep(0.5)
@@ -218,6 +232,60 @@ class ImageManager:
                 continue
         
         return wordpress_images
+    
+    def _find_existing_media(self, filename):
+        """Check if media with this filename already exists
+        
+        Args:
+            filename: Name of file to search for
+            
+        Returns:
+            Media dict with 'id', 'src', 'name', 'alt' or None if not found
+        """
+        try:
+            # Get base filename without extension
+            base_name = Path(filename).stem
+            
+            # Search for media by filename (without extension)
+            url = f"{self.wordpress_url}/wp-json/wp/v2/media"
+            params = {
+                'search': base_name,
+                'per_page': 100,
+                'orderby': 'date',
+                'order': 'desc'  # Get most recent first
+            }
+            
+            response = requests.get(
+                url,
+                auth=self.auth,
+                params=params,
+                headers={'User-Agent': 'Shopify-WooCommerce-Migrator/1.0'},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                media_items = response.json()
+                
+                # Look for filename match (base name matches, ignoring WordPress suffixes like -1, -2, -scaled)
+                for media in media_items:
+                    media_filename = media.get('media_details', {}).get('file', '')
+                    media_title = media.get('title', {}).get('rendered', '')
+                    
+                    # Check if the base name is in the filename or title
+                    if base_name in media_filename or base_name in media_title:
+                        logger.info(f"Found existing media: {filename} → {media_title} (ID: {media['id']})")
+                        return {
+                            'id': media['id'],
+                            'src': media['source_url'],
+                            'name': media_title,
+                            'alt': media.get('alt_text', '')
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Could not search for existing media {filename}: {e}")
+            return None
     
     def cleanup_old_images(self, days=7):
         """Clean up downloaded images older than specified days
